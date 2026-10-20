@@ -127,7 +127,23 @@ pub struct CoverageArgs {
     /// Write JSON to this path (defaults to coverage.json). Only valid with --format json.
     #[arg(long, value_name = "PATH")]
     output: Option<std::path::PathBuf>,
+    /// Leave generated and fixture code out of the report. Excludes files under
+    /// `generated/` or `fixtures/` directories and files named `*_generated.rs`.
+    /// Use `--ignore-filename-regex` for any other paths.
+    #[arg(long)]
+    exclude_generated: bool,
+    /// Leave source files whose path matches this regex out of the report.
+    /// Repeatable. Passed to `cargo llvm-cov --ignore-filename-regex`.
+    #[arg(long, value_name = "REGEX")]
+    ignore_filename_regex: Vec<String>,
+    /// Keep profile data from earlier runs instead of cleaning it first, so
+    /// repeated runs collect coverage incrementally (passes `--no-clean`).
+    #[arg(long)]
+    no_clean: bool,
 }
+
+/// Path regex matching generated and fixture code. Used by `--exclude-generated`.
+const GENERATED_AND_FIXTURE_IGNORE_REGEX: &str = r"(^|/)(generated|fixtures?)/|_generated\.rs$";
 
 /// Wraps `cargo llvm-cov test`, which handles Soroban's coverage needs
 /// correctly out of the box — soroban_sdk's own test harness runs contract
@@ -211,12 +227,19 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     if !output.status.success() {
-        return Err(CliError(coverage_failure_message(
+        let mut message = coverage_failure_message(
             output.status,
             args.open,
             args.fail_under,
             &captured_stderr,
-        )));
+        );
+        // Nothing is deleted on failure. Name any output files still on disk so
+        // the user can inspect them, and say they were not validated.
+        let kept = existing_artifacts(&args);
+        if !kept.is_empty() {
+            message.push_str(&preserved_artifacts_note(&kept));
+        }
+        return Err(CliError(message));
     }
 
     validate_coverage_outputs(&args)?;
@@ -226,6 +249,60 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// `lcov.info` path, inside `--output-dir` when given.
+fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output_dir
+        .as_ref()
+        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+}
+
+/// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
+fn json_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output.clone().unwrap_or_else(|| {
+        args.output_dir
+            .as_ref()
+            .map(|dir| dir.join("coverage.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
+    })
+}
+
+/// Output files `args` asks cargo-llvm-cov to write. HTML reports go to
+/// `target/llvm-cov/html` when no `--output-dir` is given, cargo-llvm-cov's default.
+fn expected_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    match args.format {
+        Format::Text if !args.open => Vec::new(),
+        Format::Text | Format::Html => {
+            let dir = args
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("target/llvm-cov/html"));
+            vec![dir.join("index.html")]
+        }
+        Format::Lcov => vec![lcov_output_path(args)],
+        Format::Json => vec![json_output_path(args)],
+    }
+}
+
+/// Expected output files that exist on disk right now.
+fn existing_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    expected_artifacts(args)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn preserved_artifacts_note(paths: &[std::path::PathBuf]) -> String {
+    let listed = paths
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; output files were left on disk and were not validated (they may be partial, \
+         or left over from an earlier run): {listed}"
+    )
 }
 
 /// Opens the generated HTML report in the system's default browser.
@@ -716,6 +793,24 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
     }
 
+    // Generated and fixture exclusions are folded into one regex, so the
+    // user's own patterns and the preset never conflict as separate flags.
+    let mut ignore_patterns: Vec<String> = args.ignore_filename_regex.clone();
+    if args.exclude_generated {
+        ignore_patterns.push(GENERATED_AND_FIXTURE_IGNORE_REGEX.to_string());
+    }
+    if !ignore_patterns.is_empty() {
+        let combined = ignore_patterns
+            .iter()
+            .map(|pattern| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        cmd.arg("--ignore-filename-regex").arg(combined);
+    }
+    if args.no_clean {
+        cmd.arg("--no-clean");
+    }
+
     match args.format {
         Format::Text => {
             if args.open {
@@ -727,12 +822,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Lcov => {
             cmd.arg("--lcov");
-            let output_path = if let Some(dir) = &args.output_dir {
-                dir.join("lcov.info")
-            } else {
-                std::path::PathBuf::from("lcov.info")
-            };
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(lcov_output_path(args));
         }
         Format::Html => {
             cmd.arg("--html");
@@ -742,13 +832,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Json => {
             cmd.arg("--json");
-            let output_path = args.output.clone().unwrap_or_else(|| {
-                args.output_dir
-                    .as_ref()
-                    .map(|dir| dir.join("coverage.json"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
-            });
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(json_output_path(args));
         }
     }
 
@@ -777,6 +861,9 @@ mod tests {
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             output_dir: None,
             output: None,
+            exclude_generated: false,
+            ignore_filename_regex: Vec::new(),
+            no_clean: false,
         }
     }
 
@@ -784,6 +871,106 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn new_collection_flags_are_not_forwarded_by_default() {
+        let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
+        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--ignore-filename-regex".to_string()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn no_clean_is_forwarded_to_cargo_llvm_cov() {
+        let mut a = args(&[], &[]);
+        a.no_clean = true;
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        assert!(rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn exclude_generated_and_custom_patterns_share_one_ignore_regex() {
+        let mut a = args(&[], &[]);
+        a.exclude_generated = true;
+        a.ignore_filename_regex = vec!["vendor/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+
+        let flags = rendered
+            .iter()
+            .filter(|arg| *arg == "--ignore-filename-regex")
+            .count();
+        assert_eq!(flags, 1, "{rendered:?}");
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        let pattern = &rendered[position + 1];
+        assert!(pattern.contains("(?:vendor/)"), "{pattern}");
+        assert!(pattern.contains("generated|fixtures?"), "{pattern}");
+        assert!(pattern.contains("_generated"), "{pattern}");
+    }
+
+    #[test]
+    fn custom_ignore_patterns_without_preset_are_forwarded_verbatim_in_order() {
+        let mut a = args(&[], &[]);
+        a.ignore_filename_regex = vec!["a/".to_string(), "b/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        assert_eq!(rendered[position + 1], "(?:a/)|(?:b/)");
+    }
+
+    #[test]
+    fn html_artifact_defaults_to_cargo_llvm_cov_report_dir() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Html;
+        assert_eq!(
+            expected_artifacts(&a),
+            vec![std::path::PathBuf::from("target/llvm-cov/html/index.html")]
+        );
+    }
+
+    #[test]
+    fn text_without_open_expects_no_artifacts() {
+        assert!(expected_artifacts(&args(&[], &[])).is_empty());
+    }
+
+    #[test]
+    fn failed_run_reports_kept_json_artifact_with_spaces_in_path() {
+        let dir = std::env::temp_dir().join(format!("stk cov kept {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("partial report.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(json_path.clone());
+
+        let kept = existing_artifacts(&a);
+        assert_eq!(kept, vec![json_path.clone()]);
+        let note = preserved_artifacts_note(&kept);
+        assert!(
+            note.contains("were left on disk and were not validated"),
+            "{note}"
+        );
+        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_run_reports_nothing_when_no_artifact_exists() {
+        let absent =
+            std::env::temp_dir().join(format!("stk-cov-absent-{}.json", std::process::id()));
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(absent);
+        assert!(existing_artifacts(&a).is_empty());
     }
 
     #[test]

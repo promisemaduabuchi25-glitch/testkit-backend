@@ -36,6 +36,9 @@ fn coverage_help_documents_options_and_platform_notes() {
     assert!(stdout.contains("--exclude"), "{stdout}");
     assert!(stdout.contains("--output-dir"), "{stdout}");
     assert!(stdout.contains("--output"), "{stdout}");
+    assert!(stdout.contains("--exclude-generated"), "{stdout}");
+    assert!(stdout.contains("--ignore-filename-regex"), "{stdout}");
+    assert!(stdout.contains("--no-clean"), "{stdout}");
 }
 
 #[test]

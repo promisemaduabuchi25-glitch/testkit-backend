@@ -551,19 +551,25 @@ Use `clap` with derive. Three subcommands, built in this order.
 Wraps coverage collection for the WASM target, which does not work out of the box.
 
 ```
-soroban-testkit coverage [--format text|lcov|html|json] [--fail-under <pct>] [--open]
+soroban-testkit coverage [--format text|lcov|html|json] [--fail-under <pct>] [--open] [--exclude-generated] [--ignore-filename-regex <regex> ...] [--no-clean]
 ```
 
 Shells out to the underlying coverage tool. Its job is knowing the right flags for Soroban's target, not reimplementing coverage.
 JSON mode writes machine-readable cargo-llvm-cov output to `coverage.json` by default, or to `--output <path>`. When only `--output-dir` is provided, it writes `<dir>/coverage.json`. `--open` is HTML-only.
+
+`--exclude-generated` leaves out files under `generated/` or `fixtures/` directories and files named `*_generated.rs`. `--ignore-filename-regex` leaves out any other source paths matching a regex. Both become a single `--ignore-filename-regex` argument to cargo-llvm-cov. `--no-clean` passes `--no-clean` so profile data from earlier runs is kept for incremental collection.
+
+When cargo-llvm-cov exits non-zero, nothing is deleted. The error lists any output files still on disk and says they were not validated, since they may be partial or left over from an earlier run.
 
 ### `soroban-testkit limits`
 
 Empirically discovers resource ceilings rather than guessing them.
 
 ```
-soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...]
+soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...] [--jobs <n>]
 ```
+
+`--jobs <n>` (1 to 8, default 1) is opt-in. It probes up to `n` consecutive ramp values concurrently while doubling, and reads results back in ramp order, stopping at the first failure. The reported boundary matches a sequential run. Probes past the first failure still run to completion but are discarded. Binary refinement always runs one probe at a time.
 
 The contract path must point to an existing compiled WASM file; `limits` does not
 build contracts. Chain your build and limits invocation with `&&` so a failed
